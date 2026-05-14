@@ -19,30 +19,8 @@ const os         = require('os');
 
 const app  = express();
 const PORT = process.env.PORT || 3001;
-
-// Use yt-dlp and ffmpeg from node_modules if available
-let YTDLP_CMD = process.env.YTDLP_PATH;
-let FFMPEG_CMD = process.env.FFMPEG_PATH;
-
-// Try to find yt-dlp from npm package
-if (!YTDLP_CMD) {
-  try {
-    const ytdlpPath = require.resolve('yt-dlp');
-    YTDLP_CMD = path.join(path.dirname(ytdlpPath), '..', 'bin', process.platform === 'win32' ? 'yt-dlp.exe' : 'yt-dlp');
-  } catch (e) {
-    YTDLP_CMD = process.platform === 'win32' ? 'yt-dlp.exe' : 'yt-dlp';
-  }
-}
-
-// Try to find ffmpeg from npm package
-if (!FFMPEG_CMD) {
-  try {
-    const ffmpegPath = require('@ffmpeg-installer/ffmpeg');
-    FFMPEG_CMD = ffmpegPath.path;
-  } catch (e) {
-    FFMPEG_CMD = 'ffmpeg';
-  }
-}
+const YTDLP_CMD = process.env.YTDLP_PATH || (process.platform === 'win32' ? 'yt-dlp.exe' : 'yt-dlp');
+const FFMPEG_CMD = process.env.FFMPEG_PATH || 'ffmpeg';
 
 // ── Temp download directory ──────────────────────────────────────────────────
 const TMP_DIR = path.join(os.tmpdir(), 'ytdl-downloads');

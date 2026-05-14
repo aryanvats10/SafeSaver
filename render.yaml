@@ -3,7 +3,7 @@ services:
     name: safe-saver
     env: node
     plan: free
-    buildCommand: npm install
+    buildCommand: apt-get update && apt-get install -y ffmpeg python3-pip && pip3 install yt-dlp && npm install
     startCommand: node server.js
     envVars:
       - key: PORT

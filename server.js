@@ -57,97 +57,17 @@ function getBaseArgs() {
   return args;
 }
 
-// ── Invidious fallback (used when YouTube blocks yt-dlp on cloud server IPs) ──
-const INVIDIOUS_INSTANCES = [
-  'https://inv.nadeko.net',
-  'https://invidious.privacyredirect.com',
-  'https://yt.artemislena.eu',
-  'https://invidious.nerdvpn.de',
-];
+// ── pytubefix fallback (used when YouTube blocks yt-dlp on cloud server IPs) ──
+const HELPER = path.join(__dirname, 'ytfix_helper.py');
 
-function extractVideoId(url) {
-  try {
-    const parsed = new URL(url);
-    if (parsed.hostname === 'youtu.be') return parsed.pathname.slice(1).split('?')[0];
-    return parsed.searchParams.get('v');
-  } catch { return null; }
-}
-
-function fetchJson(url) {
+function runPyHelper(args) {
   return new Promise((resolve, reject) => {
-    const lib = url.startsWith('https') ? https : http;
-    const req = lib.get(url, { headers: { 'User-Agent': 'Mozilla/5.0' }, timeout: 10000 }, res => {
-      let data = '';
-      res.on('data', chunk => { data += chunk; });
-      res.on('end', () => {
-        if (res.statusCode !== 200) return reject(new Error(`HTTP ${res.statusCode}`));
-        try { resolve(JSON.parse(data)); } catch (e) { reject(e); }
-      });
+    execFile('python3', [HELPER, ...args], { maxBuffer: 10 * 1024 * 1024, timeout: 30000 }, (err, stdout, stderr) => {
+      if (err) return reject(new Error(stderr || err.message));
+      try { resolve(JSON.parse(stdout.trim())); }
+      catch (e) { reject(new Error('pytubefix returned invalid JSON: ' + stdout.slice(0, 200))); }
     });
-    req.on('error', reject);
-    req.on('timeout', () => { req.destroy(); reject(new Error('Request timed out')); });
   });
-}
-
-async function fetchFromInvidious(videoId) {
-  for (const instance of INVIDIOUS_INSTANCES) {
-    try {
-      const data = await fetchJson(`${instance}/api/v1/videos/${videoId}?fields=title,author,lengthSeconds,viewCount,published,videoThumbnails,adaptiveFormats,formatStreams`);
-      return { data, instance };
-    } catch (e) {
-      console.warn(`[invidious] ${instance} failed: ${e.message}`);
-    }
-  }
-  throw new Error('All Invidious instances failed');
-}
-
-function invidiousToFormats(data) {
-  const formats = [];
-  // Adaptive formats (separate video/audio streams)
-  for (const f of (data.adaptiveFormats || [])) {
-    const isVideo = f.type && f.type.startsWith('video/');
-    const isAudio = f.type && f.type.startsWith('audio/');
-    const ext = (f.container || (f.type || '').split('/')[1] || 'mp4').split(';')[0];
-    formats.push({
-      format_id:  f.itag ? String(f.itag) : null,
-      ext,
-      resolution: f.size || (f.qualityLabel ? f.qualityLabel.replace('p', 'x') : null),
-      height:     f.qualityLabel ? parseInt(f.qualityLabel) : null,
-      fps:        f.fps || null,
-      vcodec:     isVideo ? (f.encoding || ext) : null,
-      acodec:     isAudio ? (f.encoding || ext) : null,
-      filesize:   f.contentLength ? parseInt(f.contentLength) : null,
-      tbr:        f.bitrate ? Math.round(f.bitrate / 1000) : null,
-      abr:        isAudio && f.bitrate ? Math.round(f.bitrate / 1000) : null,
-      vbr:        isVideo && f.bitrate ? Math.round(f.bitrate / 1000) : null,
-      hasVideo:   isVideo,
-      hasAudio:   isAudio,
-      note:       f.qualityLabel || f.audioQuality || '',
-      _url:       f.url,
-    });
-  }
-  // Combined format streams
-  for (const f of (data.formatStreams || [])) {
-    const ext = (f.container || 'mp4').split(';')[0];
-    formats.push({
-      format_id:  f.itag ? String(f.itag) : null,
-      ext,
-      resolution: f.size || f.qualityLabel || null,
-      height:     f.qualityLabel ? parseInt(f.qualityLabel) : null,
-      fps:        f.fps || null,
-      vcodec:     f.encoding || ext,
-      acodec:     f.encoding || ext,
-      filesize:   f.contentLength ? parseInt(f.contentLength) : null,
-      tbr:        f.bitrate ? Math.round(f.bitrate / 1000) : null,
-      abr:        null,
-      vbr:        null,
-      hasVideo:   true,
-      hasAudio:   true,
-      note:       f.qualityLabel || '',
-      _url:       f.url,
-    });
-  }
-  return formats.sort((a, b) => (b.height || 0) - (a.height || 0));
 }
 
 function isBotDetectionError(msg) {
@@ -346,33 +266,28 @@ app.get('/api/info', async (req, res) => {
     });
 
   } catch (err) {
-    // If YouTube blocked yt-dlp (bot detection), fall back to Invidious
+    // If YouTube blocked yt-dlp, fall back to pytubefix (uses InnerTube API, bypasses bot detection)
     if (isBotDetectionError(err.message)) {
-      console.warn('[/api/info] yt-dlp bot-detected — trying Invidious fallback');
+      console.warn('[/api/info] yt-dlp bot-detected — trying pytubefix fallback');
       try {
-        const videoId = extractVideoId(url);
-        if (!videoId) throw new Error('Could not extract video ID');
-        const { data, instance } = await fetchFromInvidious(videoId);
-        const formats = invidiousToFormats(data);
-        const thumbs = (data.videoThumbnails || []).slice(0, 8).map(t => ({
-          url: t.url, width: t.width || null, height: t.height || null, id: t.quality,
-        }));
+        const data = await runPyHelper(['info', url]);
+        if (data.error) throw new Error(data.error);
         return res.json({
-          id:           videoId,
+          id:           data.id,
           title:        data.title,
-          channel:      data.author,
-          duration:     data.lengthSeconds,
-          duration_str: formatDuration(data.lengthSeconds),
-          thumbnail:    thumbs[0]?.url || null,
-          view_count:   data.viewCount,
-          upload_date:  data.published ? String(new Date(data.published * 1000).toISOString().slice(0,10).replace(/-/g,'')) : null,
-          is_short:     url.includes('/shorts/'),
-          thumbnails:   thumbs,
-          formats,
-          _source: instance,
+          channel:      data.channel,
+          duration:     data.duration,
+          duration_str: formatDuration(data.duration),
+          thumbnail:    data.thumbnail,
+          view_count:   data.view_count,
+          upload_date:  data.upload_date,
+          is_short:     data.is_short,
+          thumbnails:   data.thumbnails,
+          formats:      data.formats,
+          _source:      data._source,
         });
-      } catch (invErr) {
-        console.error('[/api/info] Invidious fallback also failed:', invErr.message);
+      } catch (pyErr) {
+        console.error('[/api/info] pytubefix fallback failed:', pyErr.message);
         return res.status(500).json({ error: 'YouTube is blocking this server. Try again later or provide valid YouTube cookies in the YOUTUBE_COOKIES secret.' });
       }
     }
@@ -462,29 +377,23 @@ app.get('/api/download', async (req, res) => {
     });
 
   } catch (err) {
-    // If YouTube blocked yt-dlp, fall back to Invidious stream URL redirect
+    // If YouTube blocked yt-dlp, fall back to pytubefix stream
     if (isBotDetectionError(err.message) && !isAudioConvert) {
-      console.warn('[/api/download] yt-dlp bot-detected — trying Invidious stream redirect');
+      console.warn('[/api/download] yt-dlp bot-detected — trying pytubefix stream fallback');
       try {
-        const videoId = extractVideoId(url);
-        if (!videoId) throw new Error('Could not extract video ID');
-        const { data, instance } = await fetchFromInvidious(videoId);
-        const formats = invidiousToFormats(data);
-        // Pick best matching format
-        const target = format_id
-          ? formats.find(f => f.format_id === format_id)
-          : formats.find(f => f.hasVideo && f.hasAudio);
-        const streamUrl = target?._url;
-        if (!streamUrl) throw new Error('No stream URL found in Invidious response');
-        const safeName = sanitizeFilename(filenameHint || data.title || 'download');
-        const ext = target.ext || 'mp4';
+        const helperArgs = format_id ? ['stream', url, format_id] : ['stream', url];
+        const stream = await runPyHelper(helperArgs);
+        if (stream.error) throw new Error(stream.error);
+        const streamUrl = stream.url;
+        if (!streamUrl) throw new Error('No stream URL from pytubefix');
+        const safeName = sanitizeFilename(filenameHint || stream.title || 'download');
+        const ext = stream.ext || 'mp4';
         res.setHeader('Content-Disposition', `attachment; filename="${safeName}.${ext}"`);
         res.setHeader('Content-Type', getMimeType(ext));
-        // Pipe the stream from Invidious directly to the client
         const lib = streamUrl.startsWith('https') ? https : http;
-        lib.get(streamUrl, { headers: { 'User-Agent': 'Mozilla/5.0', 'Referer': instance } }, upstream => {
+        lib.get(streamUrl, { headers: { 'User-Agent': 'Mozilla/5.0' } }, upstream => {
           if (upstream.statusCode !== 200) {
-            if (!res.headersSent) res.status(502).json({ error: `Invidious stream returned ${upstream.statusCode}` });
+            if (!res.headersSent) res.status(502).json({ error: `Stream returned HTTP ${upstream.statusCode}` });
             return;
           }
           if (upstream.headers['content-length']) res.setHeader('Content-Length', upstream.headers['content-length']);
@@ -493,8 +402,8 @@ app.get('/api/download', async (req, res) => {
           if (!res.headersSent) res.status(500).json({ error: e.message });
         });
         return;
-      } catch (invErr) {
-        console.error('[/api/download] Invidious fallback failed:', invErr.message);
+      } catch (pyErr) {
+        console.error('[/api/download] pytubefix fallback failed:', pyErr.message);
         if (!res.headersSent) return res.status(500).json({ error: 'YouTube is blocking this server. Try again later or provide valid YouTube cookies.' });
       }
     }

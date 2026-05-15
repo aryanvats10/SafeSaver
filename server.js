@@ -16,6 +16,8 @@ const { execFile, execFileSync, spawn } = require('child_process');
 const path       = require('path');
 const fs         = require('fs');
 const os         = require('os');
+const https      = require('https');
+const http       = require('http');
 
 const app  = express();
 const PORT = process.env.PORT || 5000;
@@ -53,6 +55,103 @@ function getBaseArgs() {
     args.push('--cookies', COOKIES_FILE);
   }
   return args;
+}
+
+// ── Invidious fallback (used when YouTube blocks yt-dlp on cloud server IPs) ──
+const INVIDIOUS_INSTANCES = [
+  'https://inv.nadeko.net',
+  'https://invidious.privacyredirect.com',
+  'https://yt.artemislena.eu',
+  'https://invidious.nerdvpn.de',
+];
+
+function extractVideoId(url) {
+  try {
+    const parsed = new URL(url);
+    if (parsed.hostname === 'youtu.be') return parsed.pathname.slice(1).split('?')[0];
+    return parsed.searchParams.get('v');
+  } catch { return null; }
+}
+
+function fetchJson(url) {
+  return new Promise((resolve, reject) => {
+    const lib = url.startsWith('https') ? https : http;
+    const req = lib.get(url, { headers: { 'User-Agent': 'Mozilla/5.0' }, timeout: 10000 }, res => {
+      let data = '';
+      res.on('data', chunk => { data += chunk; });
+      res.on('end', () => {
+        if (res.statusCode !== 200) return reject(new Error(`HTTP ${res.statusCode}`));
+        try { resolve(JSON.parse(data)); } catch (e) { reject(e); }
+      });
+    });
+    req.on('error', reject);
+    req.on('timeout', () => { req.destroy(); reject(new Error('Request timed out')); });
+  });
+}
+
+async function fetchFromInvidious(videoId) {
+  for (const instance of INVIDIOUS_INSTANCES) {
+    try {
+      const data = await fetchJson(`${instance}/api/v1/videos/${videoId}?fields=title,author,lengthSeconds,viewCount,published,videoThumbnails,adaptiveFormats,formatStreams`);
+      return { data, instance };
+    } catch (e) {
+      console.warn(`[invidious] ${instance} failed: ${e.message}`);
+    }
+  }
+  throw new Error('All Invidious instances failed');
+}
+
+function invidiousToFormats(data) {
+  const formats = [];
+  // Adaptive formats (separate video/audio streams)
+  for (const f of (data.adaptiveFormats || [])) {
+    const isVideo = f.type && f.type.startsWith('video/');
+    const isAudio = f.type && f.type.startsWith('audio/');
+    const ext = (f.container || (f.type || '').split('/')[1] || 'mp4').split(';')[0];
+    formats.push({
+      format_id:  f.itag ? String(f.itag) : null,
+      ext,
+      resolution: f.size || (f.qualityLabel ? f.qualityLabel.replace('p', 'x') : null),
+      height:     f.qualityLabel ? parseInt(f.qualityLabel) : null,
+      fps:        f.fps || null,
+      vcodec:     isVideo ? (f.encoding || ext) : null,
+      acodec:     isAudio ? (f.encoding || ext) : null,
+      filesize:   f.contentLength ? parseInt(f.contentLength) : null,
+      tbr:        f.bitrate ? Math.round(f.bitrate / 1000) : null,
+      abr:        isAudio && f.bitrate ? Math.round(f.bitrate / 1000) : null,
+      vbr:        isVideo && f.bitrate ? Math.round(f.bitrate / 1000) : null,
+      hasVideo:   isVideo,
+      hasAudio:   isAudio,
+      note:       f.qualityLabel || f.audioQuality || '',
+      _url:       f.url,
+    });
+  }
+  // Combined format streams
+  for (const f of (data.formatStreams || [])) {
+    const ext = (f.container || 'mp4').split(';')[0];
+    formats.push({
+      format_id:  f.itag ? String(f.itag) : null,
+      ext,
+      resolution: f.size || f.qualityLabel || null,
+      height:     f.qualityLabel ? parseInt(f.qualityLabel) : null,
+      fps:        f.fps || null,
+      vcodec:     f.encoding || ext,
+      acodec:     f.encoding || ext,
+      filesize:   f.contentLength ? parseInt(f.contentLength) : null,
+      tbr:        f.bitrate ? Math.round(f.bitrate / 1000) : null,
+      abr:        null,
+      vbr:        null,
+      hasVideo:   true,
+      hasAudio:   true,
+      note:       f.qualityLabel || '',
+      _url:       f.url,
+    });
+  }
+  return formats.sort((a, b) => (b.height || 0) - (a.height || 0));
+}
+
+function isBotDetectionError(msg) {
+  return /sign in to confirm|bot|not a bot|cookies.*authentication/i.test(msg);
 }
 
 // ── Temp download directory ──────────────────────────────────────────────────
@@ -247,6 +346,36 @@ app.get('/api/info', async (req, res) => {
     });
 
   } catch (err) {
+    // If YouTube blocked yt-dlp (bot detection), fall back to Invidious
+    if (isBotDetectionError(err.message)) {
+      console.warn('[/api/info] yt-dlp bot-detected — trying Invidious fallback');
+      try {
+        const videoId = extractVideoId(url);
+        if (!videoId) throw new Error('Could not extract video ID');
+        const { data, instance } = await fetchFromInvidious(videoId);
+        const formats = invidiousToFormats(data);
+        const thumbs = (data.videoThumbnails || []).slice(0, 8).map(t => ({
+          url: t.url, width: t.width || null, height: t.height || null, id: t.quality,
+        }));
+        return res.json({
+          id:           videoId,
+          title:        data.title,
+          channel:      data.author,
+          duration:     data.lengthSeconds,
+          duration_str: formatDuration(data.lengthSeconds),
+          thumbnail:    thumbs[0]?.url || null,
+          view_count:   data.viewCount,
+          upload_date:  data.published ? String(new Date(data.published * 1000).toISOString().slice(0,10).replace(/-/g,'')) : null,
+          is_short:     url.includes('/shorts/'),
+          thumbnails:   thumbs,
+          formats,
+          _source: instance,
+        });
+      } catch (invErr) {
+        console.error('[/api/info] Invidious fallback also failed:', invErr.message);
+        return res.status(500).json({ error: 'YouTube is blocking this server. Try again later or provide valid YouTube cookies in the YOUTUBE_COOKIES secret.' });
+      }
+    }
     console.error('[/api/info]', err.message);
     res.status(500).json({ error: err.message });
   }
@@ -333,6 +462,42 @@ app.get('/api/download', async (req, res) => {
     });
 
   } catch (err) {
+    // If YouTube blocked yt-dlp, fall back to Invidious stream URL redirect
+    if (isBotDetectionError(err.message) && !isAudioConvert) {
+      console.warn('[/api/download] yt-dlp bot-detected — trying Invidious stream redirect');
+      try {
+        const videoId = extractVideoId(url);
+        if (!videoId) throw new Error('Could not extract video ID');
+        const { data, instance } = await fetchFromInvidious(videoId);
+        const formats = invidiousToFormats(data);
+        // Pick best matching format
+        const target = format_id
+          ? formats.find(f => f.format_id === format_id)
+          : formats.find(f => f.hasVideo && f.hasAudio);
+        const streamUrl = target?._url;
+        if (!streamUrl) throw new Error('No stream URL found in Invidious response');
+        const safeName = sanitizeFilename(filenameHint || data.title || 'download');
+        const ext = target.ext || 'mp4';
+        res.setHeader('Content-Disposition', `attachment; filename="${safeName}.${ext}"`);
+        res.setHeader('Content-Type', getMimeType(ext));
+        // Pipe the stream from Invidious directly to the client
+        const lib = streamUrl.startsWith('https') ? https : http;
+        lib.get(streamUrl, { headers: { 'User-Agent': 'Mozilla/5.0', 'Referer': instance } }, upstream => {
+          if (upstream.statusCode !== 200) {
+            if (!res.headersSent) res.status(502).json({ error: `Invidious stream returned ${upstream.statusCode}` });
+            return;
+          }
+          if (upstream.headers['content-length']) res.setHeader('Content-Length', upstream.headers['content-length']);
+          upstream.pipe(res);
+        }).on('error', e => {
+          if (!res.headersSent) res.status(500).json({ error: e.message });
+        });
+        return;
+      } catch (invErr) {
+        console.error('[/api/download] Invidious fallback failed:', invErr.message);
+        if (!res.headersSent) return res.status(500).json({ error: 'YouTube is blocking this server. Try again later or provide valid YouTube cookies.' });
+      }
+    }
     console.error('[/api/download]', err.message);
     if (!res.headersSent) res.status(500).json({ error: err.message });
   }

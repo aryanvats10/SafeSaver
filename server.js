@@ -18,7 +18,8 @@ const fs         = require('fs');
 const os         = require('os');
 
 const app  = express();
-const PORT = process.env.PORT || 3001;
+const PORT = process.env.PORT || 5000;
+const HOST = process.env.HOST || '0.0.0.0';
 const YTDLP_CMD = process.env.YTDLP_PATH || (process.platform === 'win32' ? 'yt-dlp.exe' : 'yt-dlp');
 const FFMPEG_CMD = process.env.FFMPEG_PATH || 'ffmpeg';
 
@@ -442,8 +443,8 @@ process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
 process.on('SIGINT', () => gracefulShutdown('SIGINT'));
 
 // ── Start ─────────────────────────────────────────────────────────────────────
-server = app.listen(PORT, () => {
-  console.log(`\n✅ YTDL backend running at http://localhost:${PORT}`);
+server = app.listen(PORT, HOST, () => {
+  console.log(`\n✅ YTDL backend running at http://${HOST}:${PORT}`);
   console.log(`   Frontend:  http://localhost:${PORT}`);
   console.log(`   Info API:  http://localhost:${PORT}/api/info?url=...`);
   console.log(`   Download:  http://localhost:${PORT}/api/download?url=...&format_id=...`);

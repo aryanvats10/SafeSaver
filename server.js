@@ -23,6 +23,13 @@ const HOST = process.env.HOST || '0.0.0.0';
 const YTDLP_CMD = process.env.YTDLP_PATH || (process.platform === 'win32' ? 'yt-dlp.exe' : 'yt-dlp');
 const FFMPEG_CMD = process.env.FFMPEG_PATH || 'ffmpeg';
 
+// Default args added to every yt-dlp call to bypass YouTube bot detection on server IPs
+const YTDLP_BASE_ARGS = [
+  '--extractor-args', 'youtube:player_client=android,web',
+  '--no-check-certificates',
+  '--user-agent', 'Mozilla/5.0 (Linux; Android 11; Pixel 5) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/90.0.4430.91 Mobile Safari/537.36',
+];
+
 // ── Temp download directory ──────────────────────────────────────────────────
 const TMP_DIR = path.join(os.tmpdir(), 'ytdl-downloads');
 if (!fs.existsSync(TMP_DIR)) fs.mkdirSync(TMP_DIR, { recursive: true });
@@ -135,6 +142,7 @@ app.get('/api/info', async (req, res) => {
   try {
     const playlistMode = isPlaylistUrl(url);
     const infoArgs = [
+      ...YTDLP_BASE_ARGS,
       '--no-warnings',
       ...(playlistMode ? ['--dump-single-json', '--yes-playlist'] : ['--dump-json', '--no-playlist']),
       url
@@ -248,6 +256,7 @@ app.get('/api/download', async (req, res) => {
     if (isAudioConvert) {
       // Extract audio and convert
       ytdlpArgs = [
+        ...YTDLP_BASE_ARGS,
         ...(isPlaylistUrl(url) ? ['--yes-playlist', '--playlist-items', '1'] : ['--no-playlist']),
         '--no-warnings',
         '-x',                           // extract audio
@@ -259,11 +268,8 @@ app.get('/api/download', async (req, res) => {
       ];
     } else {
       // Video download (merge video+audio if needed)
-      const fmtArg = format_id
-        ? `${format_id}+bestaudio/best[height<=${format_id}]/best`
-        : 'bestvideo+bestaudio/best';
-
       ytdlpArgs = [
+        ...YTDLP_BASE_ARGS,
         ...(isPlaylistUrl(url) ? ['--yes-playlist', '--playlist-items', '1'] : ['--no-playlist']),
         '--no-warnings',
         '-f', format_id || 'bestvideo+bestaudio/best',
@@ -325,6 +331,7 @@ app.get('/api/stream-progress', (req, res) => {
   const send = data => res.write(`data: ${JSON.stringify(data)}\n\n`);
 
   const proc = spawn(YTDLP_CMD, [
+    ...YTDLP_BASE_ARGS,
     ...(isPlaylistUrl(url) ? ['--yes-playlist', '--playlist-items', '1'] : ['--no-playlist']),
     '--newline',
     '--progress',

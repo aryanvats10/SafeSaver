@@ -23,12 +23,37 @@ const HOST = process.env.HOST || '0.0.0.0';
 const YTDLP_CMD = process.env.YTDLP_PATH || (process.platform === 'win32' ? 'yt-dlp.exe' : 'yt-dlp');
 const FFMPEG_CMD = process.env.FFMPEG_PATH || 'ffmpeg';
 
-// Default args added to every yt-dlp call to bypass YouTube bot detection on server IPs
-const YTDLP_BASE_ARGS = [
-  '--extractor-args', 'youtube:player_client=android,web',
-  '--no-check-certificates',
-  '--user-agent', 'Mozilla/5.0 (Linux; Android 11; Pixel 5) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/90.0.4430.91 Mobile Safari/537.36',
-];
+// ── YouTube Cookies (required to bypass bot detection on cloud server IPs) ────
+// Set the YOUTUBE_COOKIES environment variable with the full contents of a
+// cookies.txt file exported from your browser while logged into YouTube.
+const COOKIES_FILE = path.join(os.tmpdir(), 'yt-cookies.txt');
+const COOKIES_CONTENT = process.env.YOUTUBE_COOKIES || '';
+
+if (COOKIES_CONTENT) {
+  try {
+    fs.writeFileSync(COOKIES_FILE, COOKIES_CONTENT, 'utf8');
+    console.log('✅ YouTube cookies loaded — bot detection bypass active');
+  } catch (e) {
+    console.warn('⚠️  Failed to write cookies file:', e.message);
+  }
+} else {
+  console.warn('⚠️  No YOUTUBE_COOKIES set — downloads may fail on cloud server IPs');
+}
+
+// Default args added to every yt-dlp call
+function getBaseArgs() {
+  const args = [
+    '--extractor-args', 'youtube:player_client=web,android',
+    '--no-check-certificates',
+    '--retries', '3',
+    '--file-access-retries', '3',
+    '--fragment-retries', '3',
+  ];
+  if (COOKIES_CONTENT && fs.existsSync(COOKIES_FILE)) {
+    args.push('--cookies', COOKIES_FILE);
+  }
+  return args;
+}
 
 // ── Temp download directory ──────────────────────────────────────────────────
 const TMP_DIR = path.join(os.tmpdir(), 'ytdl-downloads');
@@ -142,7 +167,7 @@ app.get('/api/info', async (req, res) => {
   try {
     const playlistMode = isPlaylistUrl(url);
     const infoArgs = [
-      ...YTDLP_BASE_ARGS,
+      ...getBaseArgs(),
       '--no-warnings',
       ...(playlistMode ? ['--dump-single-json', '--yes-playlist'] : ['--dump-json', '--no-playlist']),
       url
@@ -256,7 +281,7 @@ app.get('/api/download', async (req, res) => {
     if (isAudioConvert) {
       // Extract audio and convert
       ytdlpArgs = [
-        ...YTDLP_BASE_ARGS,
+        ...getBaseArgs(),
         ...(isPlaylistUrl(url) ? ['--yes-playlist', '--playlist-items', '1'] : ['--no-playlist']),
         '--no-warnings',
         '-x',                           // extract audio
@@ -269,7 +294,7 @@ app.get('/api/download', async (req, res) => {
     } else {
       // Video download (merge video+audio if needed)
       ytdlpArgs = [
-        ...YTDLP_BASE_ARGS,
+        ...getBaseArgs(),
         ...(isPlaylistUrl(url) ? ['--yes-playlist', '--playlist-items', '1'] : ['--no-playlist']),
         '--no-warnings',
         '-f', format_id || 'bestvideo+bestaudio/best',
@@ -331,7 +356,7 @@ app.get('/api/stream-progress', (req, res) => {
   const send = data => res.write(`data: ${JSON.stringify(data)}\n\n`);
 
   const proc = spawn(YTDLP_CMD, [
-    ...YTDLP_BASE_ARGS,
+    ...getBaseArgs(),
     ...(isPlaylistUrl(url) ? ['--yes-playlist', '--playlist-items', '1'] : ['--no-playlist']),
     '--newline',
     '--progress',
